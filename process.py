@@ -211,6 +211,55 @@ def append_log_entries(log_path: str, entries: list[TransactionLogEntry]) -> Non
             ])
 
 
+def sentinel_path(tenant: str) -> str:
+    """Return the path of the commit sentinel file for a tenant."""
+    return f"data/{tenant}.committed"
+
+
+def write_sentinel(tenant: str, inbox_file: str) -> None:
+    """Write a sentinel file recording which inbox file has been committed to disk.
+
+    Written immediately after the balance swap so that a crash between the swap
+    and the archive step can be detected and recovered on the next run.
+    The sentinel stores the inbox path so recovery knows exactly which file to archive.
+    """
+    with open(sentinel_path(tenant), "w") as f:
+        f.write(inbox_file)
+
+
+def clear_sentinel(tenant: str) -> None:
+    """Remove the sentinel file once archiving completes successfully."""
+    path = sentinel_path(tenant)
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def recover_if_needed(tenant: str) -> None:
+    """Detect and recover from a previous run that committed balances but did not archive.
+
+    If a sentinel file exists the previous run wrote updated balances to disk but
+    crashed before moving the inbox file to archive. Without recovery the next run
+    would reload the already-updated balances and apply the same transactions again,
+    causing double-spending. Recovery completes the archive step and removes the
+    sentinel so the current run can proceed with a clean inbox.
+    """
+    path = sentinel_path(tenant)
+    if not os.path.exists(path):
+        return
+
+    with open(path) as f:
+        orphaned_inbox = f.read().strip()
+
+    if os.path.exists(orphaned_inbox):
+        print(f"[RECOVERY] Sentinel found — previous run committed but did not archive.")
+        archive_name = archive_inbox_file(orphaned_inbox, tenant)
+        print(f"[RECOVERY] Archived orphaned inbox file to {archive_name}")
+    else:
+        print(f"[RECOVERY] Sentinel found but inbox file already gone — clearing sentinel.")
+
+    clear_sentinel(tenant)
+
+
 def write_balances_atomic(balance_path: str, balance_dict: dict[str, Decimal]) -> None:
     """Write the updated balance dict to disk via an atomic temp-file swap.
 
@@ -230,8 +279,6 @@ def archive_inbox_file(inbox_file: str, tenant: str) -> str:
     """Move the processed inbox file into data/archive/ with a UTC timestamp suffix.
 
     Returns the destination archive path.
-    Archiving happens last — a crash before this point leaves the file in inbox,
-    allowing a safe full rerun.
     """
     archive_ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     archive_name = f"data/archive/{tenant}_transactions_{archive_ts}.csv"
@@ -248,12 +295,15 @@ def commit_results(
 ) -> None:
     """Persist all simulation results to disk, then archive the input file.
 
-    Execution order: append log → atomic balance swap → archive.
-    Only called after a clean simulation run — any earlier crash leaves disk unchanged.
+    Execution order: append log → atomic balance swap → sentinel → archive → clear sentinel.
+    The sentinel written between the balance swap and the archive allows a crash in that
+    window to be detected and safely completed on the next run.
     """
     append_log_entries(f"data/{tenant}_transaction_log.csv", ledger_log_entries)
     write_balances_atomic(f"data/{tenant}_account_balances.csv", balance_dict)
+    write_sentinel(tenant, inbox_file)
     archive_name = archive_inbox_file(inbox_file, tenant)
+    clear_sentinel(tenant)
 
     print(f"[INFO] Committed {len(ledger_log_entries)} log entries.")
     print("[INFO] Balances updated atomically.")
@@ -265,6 +315,7 @@ def main() -> None:
     print(f"[INFO] Processing tenant: {tenant}")
 
     # PHASE 1: Validation and Setup
+    recover_if_needed(tenant)
     inbox_file = validate_files(tenant)
     print(f"[INFO] Phase 1 complete. Transaction file: {inbox_file}")
 

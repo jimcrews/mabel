@@ -23,6 +23,7 @@ def clear_dir(pattern: str) -> None:
 clear_dir("data/inbox/*")
 clear_dir("data/archive/*")
 clear_dir("data/*_account_balances.csv")
+clear_dir("data/*.committed")
 
 for log_file in glob.glob("data/*_transaction_log.csv"):
     open(log_file, "w").close()
